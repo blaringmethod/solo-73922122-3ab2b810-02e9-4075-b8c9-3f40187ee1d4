@@ -12,11 +12,11 @@
 └────────────┘           └─────────────────┘          └──────────────────┘
 ```
 
-- `db/init.sql` —— 全部约束逻辑（表、延迟约束触发器、站点行锁、供数视图），数据库启动时装载，持久化于系统目录
-- `api/` —— FastAPI 应用（变更集 + 转属/拆分/合并/更正便捷端点 + 供数查询）
+- `db/init.sql` —— 全部约束逻辑（表、延迟约束触发器、站点行锁、供数视图、站日 ETag 版本表与触发器），数据库启动时装载，持久化于系统目录
+- `api/` —— FastAPI 应用（变更集 + 转属/拆分/合并/更正便捷端点 + 供数查询 + 站日 ETag/304）
 - `docker-compose.yml` —— `db`(postgres:16-alpine) + `api`，健康检查串联启动顺序
-- `examples/` —— 转属、历史更正、直连 SQL、并发冲突 四个示例
-- `tests/` —— pytest 集成测试（15 个用例）
+- `examples/` —— 转属、历史更正、直连 SQL、并发冲突、ETag 条件请求 五个示例
+- `tests/` —— pytest 集成测试（28 个用例）
 
 ## 数据模型与约束
 
@@ -25,6 +25,8 @@
   —— 归属时段，`[valid_from, valid_to)` **左闭右开**，`valid_to` 可空（至今有效），`CHECK (valid_to > valid_from)`
 - `observations(observation_id, station_id, observed_at, value)` —— 观测
 - `observation_attribution`（视图）—— 供数：观测按 `observed_at ∈ [valid_from, valid_to)` 关联流域
+- `observation_day_versions(station_id, day, version)` —— 站日版本表（ETag 支撑）：
+  AFTER 行触发器在每次已提交写入后把受影响站日版本 +1，行持久化于库内，重启后仍可比对
 
 两条完整性规则由 **`DEFERRABLE INITIALLY DEFERRED` 约束触发器在提交时**统一校验：
 
@@ -70,6 +72,24 @@ xdg-open http://localhost:8000/docs      # Swagger UI（或浏览器打开）
 | `POST /stations/{sid}/correct` | 历史更正：把子区间改属另一流域（自动切分原时段） |
 | `GET /stations/{sid}/observations` · `GET /attributed-observations` | 供数：按采样时刻关联流域（只见已提交状态） |
 
+### 站日 ETag（条件请求）
+
+`GET /stations/{sid}/observations` 在 `from`/`to` **恰好圈定一个 UTC 日**
+（`from = 某日 00:00Z`、`to = 次日 00:00Z`，支持等价的带偏移量表示）时提供 ETag：
+
+- 响应带 `ETag: "obs-vN"`（强验证器，不透明标签）与 `Cache-Control: no-cache`；
+- 客户端回传 `If-None-Match`，标签与当前站日版本一致时直接返回 **304**（无响应体、
+  不跑明细查询），否则返回 **200 + 当前标签 + 明细**；支持 `W/` 弱前缀、多标签列表与 `*`；
+- 标签来自库内持久化表 `observation_day_versions` 的单调版本号：
+  - 观测增删改 → 观测的**新旧站日**都换标签（改站/改采样时刻同时触碰两边；删空当天同样换）；
+  - 归属时段增删改 → 只刷新**新旧范围覆盖到观测**的站日（无观测的日子不产生版本变化）；
+  - 触发器对 API 与直连 SQL 一视同仁；回滚事务对版本的修改一并回滚，**回滚后原标签仍有效**；
+  - 版本行持久化在磁盘上，**重启后旧标签可继续使用**；
+- 整日查询先对站点行取 `FOR SHARE` 锁（与写事务的 `FOR UPDATE` 互斥），保证返回的
+  标签与明细对应**同一个已提交状态**；
+- 非整日查询（缺参数、跨度不为一天、边界不在 UTC 午夜）不发 ETag，行为与历史一致；
+  空日也有稳定标签（首次整日查询时懒创建版本行）。
+
 `update_period` 中 `valid_to` 缺省表示不修改；显式置空（恢复"至今有效"）用 `"clear_valid_to": true`。
 
 ## 示例
@@ -82,6 +102,7 @@ bash examples/02_historical_correction.sh   # 历史更正：子区间改属 + �
 docker compose exec -T db psql postgresql://watershed:watershed@localhost:5432/watershed \
   -f - < examples/03_direct_sql.sql          # 直连 SQL：中途违规→提交前修复→成功; 提交仍违规→整笔回滚
 bash examples/04_concurrent_conflict.sh      # 并发：撤段 vs 补录, 必有一方整笔被拒
+bash examples/05_etag.sh                     # ETag：整日查询 304 复用、更正后重取 200 新标签、删空当天
 ```
 
 `04` 的场景 1 依赖正常的锁等待/唤醒语义，请在 Docker/常规 Linux 环境运行
@@ -95,30 +116,34 @@ python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 # 可选: API_URL / DATABASE_URL 指向其他实例; PG_LOCK_WAIT_OK=1 启用真并发锁等待用例
 bash scripts/selftest.sh                     # 一键: 起栈 + 全部示例 + pytest
 bash scripts/restart_check.sh                # 重启 db/api 后约束仍生效(409/SQL ERROR)
+bash scripts/etag_restart_check.sh           # 重启后旧 ETag 仍 304, 新写入仍换标签
 ```
 
 ## 验证状态（如实说明）
 
-已在 **PostgreSQL 16.16 + FastAPI 0.163（本机直连，与 compose 相同的 init.sql 与启动命令）** 上验证：
+已在 **PostgreSQL 16.16 + FastAPI（本机直连，与 compose 相同的 init.sql 与启动命令）** 上验证：
 
-- ✅ 15 个集成用例中 14 通过、1 个按环境跳过：建站/时段/观测增删改查、左闭右开边界、
-  重叠拒绝、无归属拒绝、**中途违规提交前修复→成功**、**提交仍违规→整笔回滚**、
-  转属/拆分/合并/历史更正、供数按采样时刻关联、未提交数据不可见（READ COMMITTED）、
-  撤段与补录两种时序的拒绝路径、无关站并发各自提交、直连 SQL 同等约束；
-- ✅ 三个示例脚本（转属 / 历史更正 / 直连 SQL）实际运行输出正确；
-- ✅ 约束为持久化目录对象（`pg_trigger.tgdeferrable=t, tginitdeferred=t`），
-  并在**全新 initdb 集群**上重放 `init.sql` 后同样生效（重启/重建等效证据）；
-- ✅ `SET CONSTRAINTS ALL IMMEDIATE` 后继续修改，提交时仍会重新强检；
-- ✅ `/docs` 与 `/openapi.json` 可访问（HTTP 200）。
+- ✅ 28 个集成用例中 27 通过、1 个按环境跳过：原有 15 个约束/供数用例（14 通过 1 跳过）
+  全部保持，新增 13 个 ETag 用例全部通过——整日发标签与 304、弱前缀/多标签/`*`、
+  空日稳定标签、观测增删改刷新新旧站日、删空当天换标签、跨站移动双刷新、
+  时段变更只刷有观测的站日、转属/历史更正换标签、直连 SQL 同触发、回滚保标签、
+  标签与明细同快照、UTC 偏移归一；
+- ✅ 示例 01/02/03/05 实际运行输出正确；`examples/05_etag.sh` 完整演示
+  「200 取标签 → 304 复用 → 更正后旧标签 200 + 新标签 → 再 304 → 删空当天换标签且仍可 304」；
+- ✅ 重启持久性：在数据目录的**独立副本**上用全新 postmaster 进程打开（等效重启，
+  含 WAL 崩溃重放），版本行/触发器完好，旧标签 `"obs-v2"` 经全新 API 进程条件请求仍 304，
+  重启后写入正确推进到 v3；约束与 ETag 触发器均为持久化目录对象；
+- ✅ `/docs` 与 `/openapi.json` 可访问（HTTP 200），304 响应与 `If-None-Match` 参数已入 OpenAPI。
 
-未能在本环境验证（本机无 Docker，且沙箱阻断进程间信号导致**锁等待无法被唤醒**）：
+未能在本环境验证（本机无 Docker，且沙箱阻断进程间信号导致**锁等待/进程重启无法执行**）：
 
-- ⚠️ `docker compose up` 的端到端启动未实际执行；compose/Dockerfile 已做结构与语法校验，
+- ⚠️ `docker compose up` 的端到端启动未实际执行；compose/Dockerfile 本次未改动，
   栈内各组件（同一 `init.sql` 的 PG16、同一 uvicorn 命令）已分别本机验证；
 - ⚠️ 真并发下"锁等待→唤醒→提交时被拒"的跨进程路径（`PG_LOCK_WAIT_OK=1` 的用例、
   示例 04 场景 1）在本沙箱跳过；其**拒绝逻辑**已由顺序化等价用例覆盖
   （后者看到前者已提交状态后，提交时校验拒绝），锁等待/唤醒本身为 PostgreSQL 既有机制；
-- ⚠️ `scripts/restart_check.sh` 的进程重启未在本沙箱执行（无法向进程发信号）。
+- ⚠️ `scripts/restart_check.sh`、`scripts/etag_restart_check.sh` 的真实进程重启
+  （`docker compose restart` / 信号）未在本沙箱执行，已用数据目录副本 + 全新进程等效验证。
 
 ## 设计取舍与限制
 
@@ -130,3 +155,7 @@ bash scripts/restart_check.sh                # 重启 db/api 后约束仍生效(
   数据库层面无法防止拥有者自毁，生产上应收回应用账号的 DDL 权限；
 - 校验为每站 `O(时段数² → 索引下近似线性)` + 一次反连接扫描，适合站点级并发负载；
   超大批量导入建议走 `/changesets` 单事务提交。
+- ETag 用库内版本号而非内容哈希：增量写入只做一次 upsert，避免每次写入重算整日哈希；
+  版本号语义不透明（客户端只做原样比对），`FOR SHARE`/`FOR UPDATE` 锁对保证标签与明细
+  取自同一已提交快照；代价是写放大极轻（每个受影响站日一行），且版本号只增不减
+  （回滚事务的 bump 随之回滚，不会留下空洞以外的跳号问题）。

@@ -207,4 +207,117 @@ JOIN attribution_periods p
   ON p.station_id = o.station_id
  AND tstzrange(p.valid_from, p.valid_to, '[)') @> o.observed_at;
 
+-- ----------------------------------------------------------------------------
+-- 站日版本(ETag 支撑):
+--   * 每个 (站点, UTC 日) 一个单调递增版本号, 作为该站日观测供数的不透明 ETag
+--   * 行持久化在系统表空间中: 重启后旧标签仍可继续使用; 回滚的事务对版本
+--     的修改随事务一并回滚, 回滚后原标签仍然有效
+--   * 仅在两种时机建行: 观测触发器触碰, 或整日查询懒创建(当天可无观测)
+-- ----------------------------------------------------------------------------
+CREATE TABLE observation_day_versions (
+    station_id  text NOT NULL REFERENCES stations (station_id) ON DELETE CASCADE,
+    day         date NOT NULL,                 -- UTC 日历日
+    version     bigint NOT NULL,
+    CONSTRAINT observation_day_versions_pkey PRIMARY KEY (station_id, day)
+);
+
+-- 单个站日版本 +1(行不存在则建为 1)
+CREATE OR REPLACE FUNCTION touch_observation_day(p_station_id text, p_day date)
+RETURNS void
+LANGUAGE sql AS $$
+INSERT INTO observation_day_versions (station_id, day, version)
+VALUES (p_station_id, p_day, 1)
+ON CONFLICT (station_id, day)
+DO UPDATE SET version = observation_day_versions.version + 1;
+$$;
+
+-- 把 [p_lo, p_hi) 范围内"存在观测"的所有 UTC 站日各 bump 一次;
+-- p_hi 为 NULL 表示 +infinity. 范围内无观测则不产生任何版本行.
+CREATE OR REPLACE FUNCTION bump_period_range(p_station_id text,
+                                             p_lo timestamptz,
+                                             p_hi timestamptz)
+RETURNS void
+LANGUAGE sql AS $$
+INSERT INTO observation_day_versions (station_id, day, version)
+SELECT DISTINCT p_station_id, (o.observed_at AT TIME ZONE 'UTC')::date, 1
+FROM observations o
+WHERE o.station_id = p_station_id
+  AND o.observed_at >= p_lo
+  AND (p_hi IS NULL OR o.observed_at < p_hi)
+ON CONFLICT (station_id, day)
+DO UPDATE SET version = observation_day_versions.version + 1;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- 观测增删改: 新旧站日都换标签(改站/改采样时刻同时触碰新旧两个站日;
+-- 删空当天一样 bump). 直连 SQL 会话同样经过这些触发器.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION observations_bump_day_version() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        PERFORM touch_observation_day(OLD.station_id, (OLD.observed_at AT TIME ZONE 'UTC')::date);
+        RETURN OLD;
+    END IF;
+
+    PERFORM touch_observation_day(NEW.station_id, (NEW.observed_at AT TIME ZONE 'UTC')::date);
+    IF TG_OP = 'UPDATE'
+       AND (NEW.station_id IS DISTINCT FROM OLD.station_id
+            OR NEW.observed_at IS DISTINCT FROM OLD.observed_at) THEN
+        PERFORM touch_observation_day(OLD.station_id, (OLD.observed_at AT TIME ZONE 'UTC')::date);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER observations_bump_day_version
+    AFTER INSERT OR UPDATE OR DELETE ON observations
+    FOR EACH ROW EXECUTE FUNCTION observations_bump_day_version();
+
+-- ----------------------------------------------------------------------------
+-- 归属时段增删改: 只刷新新旧范围覆盖到观测的站日.
+--   * INSERT/DELETE: 该时段 [valid_from, valid_to) 内有观测的站日
+--   * UPDATE 同站: 新旧范围并集(含仅改流域的情形——供数 watershed 会变)
+--   * UPDATE 跨站: 旧站旧范围 + 新站新范围
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION periods_bump_day_versions() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_station text;
+    v_lo      timestamptz;
+    v_hi      timestamptz;   -- NULL 表示 +infinity
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        PERFORM bump_period_range(OLD.station_id, OLD.valid_from, OLD.valid_to);
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        PERFORM bump_period_range(NEW.station_id, NEW.valid_from, NEW.valid_to);
+        RETURN NEW;
+    END IF;
+
+    -- UPDATE
+    IF NEW.station_id IS DISTINCT FROM OLD.station_id THEN
+        PERFORM bump_period_range(OLD.station_id, OLD.valid_from, OLD.valid_to);
+        PERFORM bump_period_range(NEW.station_id, NEW.valid_from, NEW.valid_to);
+        RETURN NEW;
+    END IF;
+
+    v_station := NEW.station_id;
+    v_lo := least(OLD.valid_from, NEW.valid_from);
+    v_hi := greatest(COALESCE(OLD.valid_to, 'infinity'::timestamptz),
+                     COALESCE(NEW.valid_to, 'infinity'::timestamptz));
+    IF v_hi = 'infinity'::timestamptz THEN
+        v_hi := NULL;
+    END IF;
+    PERFORM bump_period_range(v_station, v_lo, v_hi);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER periods_bump_day_versions
+    AFTER INSERT OR UPDATE OR DELETE ON attribution_periods
+    FOR EACH ROW EXECUTE FUNCTION periods_bump_day_versions();
+
 COMMIT;

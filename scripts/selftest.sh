@@ -24,9 +24,15 @@ docker compose exec -T db psql postgresql://watershed:watershed@localhost:5432/w
 echo "== 示例4: 并发撤段 vs 补录 =="
 bash examples/04_concurrent_conflict.sh
 
+echo "== 示例5: 站日 ETag(304 复用 / 更正后重取 / 删空当天) =="
+bash examples/05_etag.sh
+
 echo "== 集成测试 =="
 python3 -m venv .venv
 .venv/bin/pip install -q -r tests/requirements.txt
 .venv/bin/python -m pytest tests -v
+
+echo "== ETag 重启校验 =="
+bash scripts/etag_restart_check.sh
 
 echo "== 自测完成 =="

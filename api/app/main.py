@@ -12,10 +12,11 @@ from datetime import datetime
 from typing import Optional
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 
 from .changeset import execute_changeset
 from .db import close_pool, get_pool, init_pool
+from .etag import etag_matches, make_etag, whole_utc_day
 from .models import (
     ChangeSet,
     CorrectRequest,
@@ -381,12 +382,78 @@ def correct_period(station_id: str, body: CorrectRequest):
 # 供数: 按采样时刻关联流域(只见已提交状态)
 # ---------------------------------------------------------------------------
 
-@app.get("/stations/{station_id}/observations", tags=["feed"])
+@app.get(
+    "/stations/{station_id}/observations",
+    tags=["feed"],
+    responses={
+        304: {
+            "description": "If-None-Match 命中当前站日版本: 内容未变, 无响应体",
+            "headers": {"ETag": {"description": "当前站日标签", "schema": {"type": "string"}}},
+        }
+    },
+)
 def list_attributed_observations(
     station_id: str,
+    response: Response,
     from_: Optional[datetime] = Query(None, alias="from"),
     to: Optional[datetime] = Query(None),
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
 ):
+    day = whole_utc_day(from_, to)
+
+    # 非整日查询不提供 ETag, 行为与历史一致
+    if day is None:
+        return _query_observations(station_id, from_, to)
+
+    pool = get_pool()
+    with pool.connection() as conn:
+        # FOR SHARE 与写事务的行级 FOR UPDATE 互斥: 本事务期间该站不会有
+        # 新的提交, 故下面读到的版本号与明细必然对应同一个已提交状态.
+        exists = conn.execute(
+            "SELECT 1 FROM stations WHERE station_id = %s FOR SHARE",
+            (station_id,),
+        ).fetchone()
+        if exists is None:
+            # 未知站点: 保持历史行为(空列表), 且不发 ETag
+            return []
+
+        # 懒创建站日版本行(当天可无观测: 删空当天后仍有稳定标签)
+        row = conn.execute(
+            """
+            INSERT INTO observation_day_versions (station_id, day, version)
+            VALUES (%s, %s, 1)
+            ON CONFLICT (station_id, day)
+            DO UPDATE SET version = observation_day_versions.version
+            RETURNING version
+            """,
+            (station_id, day),
+        ).fetchone()
+        etag = make_etag(row["version"])
+        response.headers["ETag"] = etag
+        # 标签需随每次写入失效, 不允许中间缓存静默复用
+        response.headers["Cache-Control"] = "no-cache"
+
+        if etag_matches(etag, if_none_match):
+            return Response(status_code=304, headers={
+                "ETag": etag,
+                "Cache-Control": "no-cache",
+            })
+
+        # 明细查询; 行锁保证期间无并发写提交, 与版本号同快照
+        return conn.execute(
+            """
+            SELECT observation_id, station_id, observed_at, value, watershed, period_id
+            FROM observation_attribution
+            WHERE station_id = %s
+              AND observed_at >= %s
+              AND observed_at < %s
+            ORDER BY observed_at
+            """,
+            (station_id, from_, to),
+        ).fetchall()
+
+
+def _query_observations(station_id: str, from_: Optional[datetime], to: Optional[datetime]):
     sql = """
         SELECT observation_id, station_id, observed_at, value, watershed, period_id
         FROM observation_attribution
